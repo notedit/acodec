@@ -66,6 +66,8 @@ func freeFFCtx(self *ffctx) {
 	}
 }
 
+
+
 type SampleFormat uint8
 
 const (
@@ -283,8 +285,13 @@ func (self *ATranscorder) Do(in []byte) (pkts [][]byte, got bool, err error) {
 
 func (self *ATranscorder) Close() {
 
+	freeFFCtx(self.decoder)
+	freeFFCtx(self.encoder)
+	C.swr_free(&self.resample)
 }
 
+
+// InPacketDuration, for test
 func (self *ATranscorder) InPacketDuration(data []byte) (dur time.Duration) {
 	ff := &self.decoder.ff
 	duration := C.av_get_audio_frame_duration(ff.codecCtx, C.int(len(data)))
@@ -292,6 +299,7 @@ func (self *ATranscorder) InPacketDuration(data []byte) (dur time.Duration) {
 	return
 }
 
+// OutPacketDuration, for test
 func (self *ATranscorder) OutPacketDuration(data []byte) (dur time.Duration) {
 	ff := &self.encoder.ff
 	duration := C.av_get_audio_frame_duration(ff.codecCtx, C.int(len(data)))
