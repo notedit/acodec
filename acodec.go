@@ -109,20 +109,12 @@ func (self SampleFormat) BytesPerSample() int {
 	}
 }
 
-type AudioFrame struct {
-	SampleFormat SampleFormat // audio sample format, e.g: S16,FLTP,...
-	Channels     int          // audio channel layout, e.g: CH_MONO,CH_STEREO,...
-	SampleCount  int          // sample count in this frame
-	SampleRate   int          // sample rate
-	Data         [][]byte     // data array for planar format len(Data) > 1
-}
-
 type ATranscorder struct {
 	encoder         *ffctx
 	decoder         *ffctx
-	framebuf        []byte
 	resample        *C.SwrContext
-	fifo 			*C.AVAudioFifo
+	fifo            *C.AVAudioFifo
+	framebuf        *C.AVFrame
 	InSampleRate    int
 	InChannels      int
 	OutSampleRate   int
@@ -184,7 +176,6 @@ func (self *ATranscorder) Setup() (err error) {
 
 	ff.frame.nb_samples = C.int(ff.codecCtx.frame_size)
 
-
 	fmt.Println("encode frame size ", int(ff.codecCtx.frame_size))
 
 	err = self.initresample()
@@ -193,6 +184,16 @@ func (self *ATranscorder) Setup() (err error) {
 	}
 
 	err = self.initfifo()
+	
+	if err != nil {
+		return 
+	}
+
+	framebuf := C.av_frame_alloc()
+	framebuf.format = C.int(C.AV_SAMPLE_FMT_S16)
+	framebuf.channel_layout = channel2ChannelLayout(self.OutChannels)
+	framebuf.sample_rate = C.int(self.OutSampleRate)
+	framebuf.channels = C.int(self.OutChannels)
 
 	return
 }
@@ -243,11 +244,13 @@ func (self *ATranscorder) initdecoder() (err error) {
 
 func (self *ATranscorder) initfifo() (err error) {
 
-	fifo := C.av_audio_fifo_alloc(C.AV_SAMPLE_FMT_S16,  C.int(self.OutChannels), 1024)
+	fifo := C.av_audio_fifo_alloc(C.AV_SAMPLE_FMT_S16, C.int(self.OutChannels), 1024)
 	if fifo == nil {
 		return fmt.Errorf("unable to allocate fifo context")
 	}
-
+	
+	self.fifo = fifo
+	
 	return
 }
 
@@ -280,7 +283,7 @@ func (self *ATranscorder) Do(in []byte) (pkts [][]byte, got bool, err error) {
 
 	fmt.Println("remain samples ", remainingSamples)
 
-	fmt.Println("out line size",  enff.frame.linesize[0])
+	fmt.Println("out line size", enff.frame.linesize[0])
 
 	for {
 		remainingSamples := int(C.swr_get_delay(self.resample, C.int64_t(self.OutSampleRate)))
