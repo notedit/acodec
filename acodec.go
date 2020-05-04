@@ -6,10 +6,10 @@ package acodec
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/audio_fifo.h>
 #include <libswresample/swresample.h>
 #include <libavutil/opt.h>
 #include <string.h>
-
 
 typedef struct {
 	AVCodec *codec;
@@ -21,13 +21,30 @@ typedef struct {
 
 int wrap_avcodec_decode_audio4(AVCodecContext *ctx, AVFrame *frame, void *data, int size, int *got) {
 	struct AVPacket pkt = {.data = data, .size = size};
-	return avcodec_decode_audio4(ctx, frame, got, &pkt);
+	int error = avcodec_decode_audio4(ctx, frame, got, &pkt);
+    if (error < 0) {
+		 fprintf(stderr, "Could not decode frame (error '%s')\n",
+                av_err2str(error));
+    }
+    return error;
 }
 
-int wrap_swresample_convert(SwrContext *avr, int *out, int outcount, int *in,  int incount) {
-	return swr_convert(avr, (void *)out, outcount, (void *)in, incount);
+int wrap_swr_convert_frame(SwrContext *swr,AVFrame* output, AVFrame* input) {
+	int error = swr_convert_frame(swr,output,input);
+	if (error < 0) {
+		 fprintf(stderr, "swr_convert_frame (error '%s')\n",
+                av_err2str(error));
+    }
+	return error;
 }
 
+int write_fifo(AVAudioFifo* fifo, AVFrame* frame, int nb_samples){
+	return av_audio_fifo_write(fifo,(void**)frame->data,nb_samples);
+}
+
+int read_fifo(AVAudioFifo* fifo, AVFrame* frame, int nb_samples){
+	return av_audio_fifo_read(fifo,(void**)frame->data,nb_samples);
+}
 
 */
 import "C"
@@ -66,17 +83,15 @@ func freeFFCtx(self *ffctx) {
 	}
 }
 
-
-
 type SampleFormat uint8
 
 const (
-	U8   = SampleFormat(iota + 1) // 8-bit unsigned integer
-	S16                           // signed 16-bit integer
-	S32                           // signed 32-bit integer
-	FLT                           // 32-bit float
-	DBL                           // 64-bit float
-	U32                           // unsigned 32-bit integer
+	U8  = SampleFormat(iota + 1) // 8-bit unsigned integer
+	S16                          // signed 16-bit integer
+	S32                          // signed 32-bit integer
+	FLT                          // 32-bit float
+	DBL                          // 64-bit float
+	U32                          // unsigned 32-bit integer
 )
 
 func (self SampleFormat) BytesPerSample() int {
@@ -102,12 +117,12 @@ type AudioFrame struct {
 	Data         [][]byte     // data array for planar format len(Data) > 1
 }
 
-
 type ATranscorder struct {
 	encoder         *ffctx
 	decoder         *ffctx
 	framebuf        []byte
 	resample        *C.SwrContext
+	fifo 			*C.AVAudioFifo
 	InSampleRate    int
 	InChannels      int
 	OutSampleRate   int
@@ -127,25 +142,22 @@ func (self *ATranscorder) Setup() (err error) {
 	ff := &self.decoder.ff
 
 	ff.frame = C.av_frame_alloc()
-	ff.frame.format = C.int(C.AV_SAMPLE_FMT_S16)
+	ff.frame.format = C.int(C.AV_SAMPLE_FMT_FLTP)
 	ff.frame.channel_layout = channel2ChannelLayout(self.InChannels)
 	ff.frame.sample_rate = C.int(self.InSampleRate)
 	ff.frame.channels = C.int(self.InChannels)
 
-
+	ff.codecCtx.sample_fmt = C.AV_SAMPLE_FMT_FLTP
 	ff.codecCtx.sample_rate = C.int(self.InSampleRate)
 	ff.codecCtx.channel_layout = channel2ChannelLayout(self.InChannels)
 	ff.codecCtx.channels = C.int(self.InChannels)
-
 
 	if C.avcodec_open2(ff.codecCtx, ff.codec, nil) != 0 {
 		err = fmt.Errorf("ffmpeg: decoder: avcodec_open2 failed")
 		return
 	}
 
-	ff.frame.nb_samples = C.int(ff.codecCtx.frame_size)
-
-	fmt.Println("decode frame size ",int(ff.codecCtx.frame_size))
+	fmt.Println("decode frame size ", int(ff.codecCtx.frame_size))
 
 	err = self.initencoder()
 	if err != nil {
@@ -160,7 +172,6 @@ func (self *ATranscorder) Setup() (err error) {
 	ff.frame.sample_rate = C.int(self.OutSampleRate)
 	ff.frame.channels = C.int(self.OutChannels)
 
-
 	ff.codecCtx.sample_fmt = C.AV_SAMPLE_FMT_S16
 	ff.codecCtx.sample_rate = C.int(self.OutSampleRate)
 	ff.codecCtx.bit_rate = C.int64_t(self.OutBitrate)
@@ -173,12 +184,15 @@ func (self *ATranscorder) Setup() (err error) {
 
 	ff.frame.nb_samples = C.int(ff.codecCtx.frame_size)
 
-	fmt.Println("encode frame size ",int(ff.codecCtx.frame_size))
+
+	fmt.Println("encode frame size ", int(ff.codecCtx.frame_size))
 
 	err = self.initresample()
 	if err != nil {
 		return
 	}
+
+	err = self.initfifo()
 
 	return
 }
@@ -188,10 +202,10 @@ func (self *ATranscorder) initresample() error {
 	swrCtx := C.swr_alloc()
 	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("in_channel_layout"), C.int64_t(channel2ChannelLayout(self.InChannels)), 0)
 	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("in_sample_rate"), C.int64_t(self.InSampleRate), 0)
-	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("in_sample_fmt"), C.int64_t(C.AV_SAMPLE_FMT_S16), 0)
+	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("in_sample_fmt"), C.int64_t(C.AV_SAMPLE_FMT_FLTP), 0)
 
 	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("out_channel_layout"), C.int64_t(channel2ChannelLayout(self.OutChannels)), 0)
-	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("out_sample_rate"), C.int64_t(self.InSampleRate), 0)
+	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("out_sample_rate"), C.int64_t(self.OutSampleRate), 0)
 	C.av_opt_set_int(unsafe.Pointer(swrCtx), C.CString("out_sample_fmt"), C.int64_t(C.AV_SAMPLE_FMT_S16), 0)
 	C.swr_init(swrCtx)
 	self.resample = swrCtx
@@ -215,15 +229,25 @@ func (self *ATranscorder) initencoder() (err error) {
 
 func (self *ATranscorder) initdecoder() (err error) {
 
-	codec := C.avcodec_find_encoder_by_name(C.CString(self.EncodeCodecName))
+	codec := C.avcodec_find_decoder_by_name(C.CString(self.DecodeCodecName))
 	if codec == nil || C.avcodec_get_type(codec.id) != C.AVMEDIA_TYPE_AUDIO {
-		err = fmt.Errorf("ffmpeg: cannot find audio encoder name=%s", self.EncodeCodecName)
+		err = fmt.Errorf("ffmpeg: cannot find audio encoder name=%s", self.DecodeCodecName)
 		return
 	}
 
-	if self.encoder, err = newFFCtxByCodec(codec); err != nil {
+	if self.decoder, err = newFFCtxByCodec(codec); err != nil {
 		return
 	}
+	return
+}
+
+func (self *ATranscorder) initfifo() (err error) {
+
+	fifo := C.av_audio_fifo_alloc(C.AV_SAMPLE_FMT_S16,  C.int(self.OutChannels), 1024)
+	if fifo == nil {
+		return fmt.Errorf("unable to allocate fifo context")
+	}
+
 	return
 }
 
@@ -243,14 +267,20 @@ func (self *ATranscorder) Do(in []byte) (pkts [][]byte, got bool, err error) {
 
 	// resample
 	outSampleCount := int(C.swr_get_out_samples(self.resample, C.int(deff.frame.nb_samples)))
+	//
+	fmt.Println("out samples", outSampleCount)
 
-	fmt.Println("out sample count ", outSampleCount)
-
-	cerr = C.swr_convert_frame(self.resample, nil, deff.frame)
+	cerr = C.wrap_swr_convert_frame(self.resample, nil, deff.frame)
 	if cerr < C.int(0) {
 		err = fmt.Errorf("ffmpeg: swr_convert_frame failed: %d", cerr)
 		return
 	}
+
+	remainingSamples := int(C.swr_get_delay(self.resample, C.int64_t(self.OutSampleRate)))
+
+	fmt.Println("remain samples ", remainingSamples)
+
+	fmt.Println("out line size",  enff.frame.linesize[0])
 
 	for {
 		remainingSamples := int(C.swr_get_delay(self.resample, C.int64_t(self.OutSampleRate)))
@@ -258,11 +288,15 @@ func (self *ATranscorder) Do(in []byte) (pkts [][]byte, got bool, err error) {
 			return
 		}
 
-		cerr = C.swr_convert_frame(self.resample, enff.frame, nil)
+		fmt.Println("remain samples", remainingSamples)
+
+		cerr = C.wrap_swr_convert_frame(self.resample, enff.frame, nil)
 		if cerr < C.int(0) {
 			err = fmt.Errorf("ffmpeg: swr_convert_frame failed: %d", cerr)
 			return
 		}
+
+		fmt.Println("samples ", int(enff.frame.nb_samples))
 
 		cpkt := C.AVPacket{}
 		cgotpkt := C.int(0)
@@ -290,7 +324,6 @@ func (self *ATranscorder) Close() {
 	C.swr_free(&self.resample)
 }
 
-
 // InPacketDuration, for test
 func (self *ATranscorder) InPacketDuration(data []byte) (dur time.Duration) {
 	ff := &self.decoder.ff
@@ -307,6 +340,9 @@ func (self *ATranscorder) OutPacketDuration(data []byte) (dur time.Duration) {
 	return
 }
 
+func (self *ATranscorder) samplesToRead() int {
+	return int(C.av_audio_fifo_size(self.fifo))
+}
 
 func channel2ChannelLayout(channel int) (layout C.uint64_t) {
 	if channel == 1 {
